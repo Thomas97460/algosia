@@ -15,7 +15,7 @@ REFRESH_TOKEN = "TON_REFRESH_TOKEN_ICI"
 EXCHANGE = "binance"
 PAIR     = "BTCUSDT"
 
-START_TS = "2025-09-10T09:00:00Z"
+START_TS = "2025-09-06T09:00:00Z"
 END_TS   = "2025-09-10T09:01:00Z"
 
 
@@ -23,7 +23,7 @@ def main():
     client = AlgosiaClient(
         refresh_token=REFRESH_TOKEN,
         base_url="https://requestor.app.algosia.ai",
-        verbose=True,
+        verbose=1,
     )
 
     # 1) Récupération en DataFrame pandas

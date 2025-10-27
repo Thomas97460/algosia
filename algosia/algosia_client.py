@@ -3,6 +3,8 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import pandas as pd
 from pandas.api.types import is_datetime64_any_dtype
+from tqdm.auto import tqdm
+from .env import EXCHANGES_CONFIG
 
 
 API_KEY_DEFAULT = "AIzaSyA4AOIsbt5TQje_sqI1eE6Wg1yp50TqVq0"
@@ -19,14 +21,24 @@ class AlgosiaClient:
                  refresh_token,
                  api_key: str = API_KEY_DEFAULT,
                  base_url: str = "https://requestor.app.algosia.ai",
-                 verbose: bool = True):
+                 verbose: int = 1):
         """Initialise le client avec refresh_token longue durée, api_key (fixe),
-        base_url de l'API et mode verbeux. Met en cache l'id_token Firebase et
-        son expiration décodée."""
+        base_url de l'API et mode verbeux.
+
+        verbose:
+          0 → silencieux
+          1 → barre de progression (tqdm) sur les downloads
+          2 → logs détaillés (mode actuel par défaut).
+        Met en cache l'id_token Firebase et son expiration décodée."""
         self.api_key = api_key
         self.refresh_token = refresh_token
         self.base_url = base_url.rstrip("/")
-        self.verbose = verbose
+        if isinstance(verbose, bool):
+            level = 2 if verbose else 0
+        else:
+            level = int(verbose)
+        self.verbose_level = max(0, min(2, level))
+        self.verbose = self.verbose_level > 0  # compat héritée
         self._id_token = None
         self._token_exp = 0.0
 
@@ -35,8 +47,10 @@ class AlgosiaClient:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%fZ")
 
     def _log(self, kind, msg):
-        """Affiche un message coloré si verbose=True. kind ∈ {"info","ok","warn","bad"}."""
-        if not self.verbose:
+        """Affiche un message selon le niveau de verbosité."""
+        if self.verbose_level == 0 and kind != "bad":
+            return
+        if self.verbose_level == 1 and kind in ("info", "ok"):
             return
         prefix, col = {
             "ok": ("✔", C.GN),
@@ -44,7 +58,11 @@ class AlgosiaClient:
             "warn": ("⚠", C.YL),
             "bad": ("✘", C.RD),
         }.get(kind, ("•", C.W))
-        print(f"{col}{prefix} [{self._now()}] {msg}{C.R}", flush=True)
+        text = f"{col}{prefix} [{self._now()}] {msg}{C.R}"
+        if self.verbose_level == 1 and tqdm is not None:
+            tqdm.write(text)
+        else:
+            print(text, flush=True)
 
     def _jwt_valid(self):
         """True si on a déjà un id_token non expiré (avec 15s de marge)."""
@@ -129,14 +147,32 @@ class AlgosiaClient:
             json.dump(obj, f, ensure_ascii=False, indent=2)
         self._log("ok", f"JSON écrit → {p}")
 
-    def _get(self, path, params=None, max_retries=3, cooldown=1.5, backoff_5xx=15.0):
+    def _get(self,
+             path,
+             params=None,
+             max_retries=3,
+             cooldown=1.5,
+             backoff_5xx=15.0,
+             req_index: int | None = None,
+             req_total: int | None = None):
         """GET authentifié avec retries (429/5xx) et refresh auto sur 401."""
         for attempt in range(1, max_retries + 1):
             token = self._ensure_token()
             url = f"{self.base_url}/{path.lstrip('/')}"
             hdrs = {"Authorization": f"Bearer {token}"}
             try:
-                self._log("info", f"GET {url} {params} ({attempt}/{max_retries})")
+                detail_parts = []
+                if params is not None:
+                    detail_parts.append(str(params))
+                if req_index is not None:
+                    if req_total is not None:
+                        detail_parts.append(f"[req {req_index}/{req_total}]")
+                    else:
+                        detail_parts.append(f"[req {req_index}]")
+                if max_retries > 1 and attempt > 1:
+                    detail_parts.append(f"(retry {attempt}/{max_retries})")
+                detail = " ".join(detail_parts) if detail_parts else ""
+                self._log("info", f"GET {url} {detail}".rstrip())
                 r = requests.get(url, headers=hdrs, params=params or {}, timeout=240)
                 self._log("info", f"⇐ {r.status_code} {r.reason} ({len(r.content or b'')} bytes)")
                 if r.status_code == 401 and attempt < max_retries:
@@ -209,25 +245,47 @@ class AlgosiaClient:
         edt = self._to_utc_dt(end_ts)
         cur = sdt
         out_rows = []
-        while cur <= edt:
-            stop = min(edt, cur + timedelta(seconds=max_points - 1))
-            params = {
-                "start_timestamp": self._isoz(cur),
-                "end_timestamp": self._isoz(stop),
-            }
-            r = self._get(route, params=params)
-            chunk = self._parse_tabular_payload(
-                r.content,
-                r.headers.get("Content-Type", ""),
-            )
-            if not chunk:
-                self._log("warn", f"Tranche vide {cur.isoformat()} → {stop.isoformat()}")
+        if edt < sdt:
+            raise ValueError("end_ts doit être >= start_ts")
+        span_seconds = int((edt - sdt).total_seconds()) + 1
+        req_total = max(1, (span_seconds + max_points - 1) // max_points)
+        if self.verbose_level == 1 and tqdm is None:
+            raise RuntimeError("tqdm est requis pour verbose=1. Installez 'tqdm'.")
+        progress = None
+        if self.verbose_level == 1:
+            progress = tqdm(total=req_total, desc=f"{route}", unit="req", leave=False)
+        req_index = 0
+        try:
+            while cur <= edt:
+                stop = min(edt, cur + timedelta(seconds=max_points - 1))
+                params = {
+                    "start_timestamp": self._isoz(cur),
+                    "end_timestamp": self._isoz(stop),
+                }
+                req_index += 1
+                r = self._get(
+                    route,
+                    params=params,
+                    req_index=req_index,
+                    req_total=req_total,
+                )
+                if progress is not None:
+                    progress.update(1)
+                chunk = self._parse_tabular_payload(
+                    r.content,
+                    r.headers.get("Content-Type", ""),
+                )
+                if not chunk:
+                    self._log("warn", f"Tranche vide {cur.isoformat()} → {stop.isoformat()}")
+                    cur = stop + timedelta(seconds=1)
+                    continue
+                out_rows.extend(chunk)
+                last_ts = self._to_utc_dt(chunk[-1][0])
+                self._log("ok", f"+{len(chunk)} lignes jusqu'à {last_ts.isoformat()}")
                 cur = stop + timedelta(seconds=1)
-                continue
-            out_rows.extend(chunk)
-            last_ts = self._to_utc_dt(chunk[-1][0])
-            self._log("ok", f"+{len(chunk)} lignes jusqu'à {last_ts.isoformat()}")
-            cur = last_ts + timedelta(seconds=1)
+        finally:
+            if progress is not None:
+                progress.close()
         return out_rows
 
     def _rows_to_df(self, rows, columns):
@@ -264,6 +322,33 @@ class AlgosiaClient:
             return data_out
         raise ValueError("output doit être 'pandas', 'csv' ou 'json'")
 
+    def _validate_exchange_pair(self, exchange, pair):
+        """Vérifie que l'exchange et la paire sont autorisés et retourne les identifiants normalisés."""
+        exchange_key = str(exchange).lower()
+        if exchange_key not in EXCHANGES_CONFIG:
+            allowed = ", ".join(sorted(EXCHANGES_CONFIG))
+            raise ValueError(f"exchange '{exchange}' non supporté. Exchanges autorisés: {allowed}")
+        pair_key = str(pair).upper()
+        symbols = EXCHANGES_CONFIG[exchange_key]["symbols"]
+        if pair_key not in symbols:
+            allowed_pairs = ", ".join(sorted(symbols))
+            raise ValueError(
+                f"paire '{pair}' non supportée pour l'exchange '{exchange}'. "
+                f"Paires autorisées: {allowed_pairs}"
+            )
+        return exchange_key, pair_key, symbols[pair_key]
+
+    def _validate_model(self, exchange_key, pair_key, model_name):
+        """Vérifie que le modèle est autorisé pour l'exchange et la paire donnés."""
+        models = EXCHANGES_CONFIG[exchange_key]["symbols"][pair_key]["models"]
+        if model_name not in models:
+            allowed_models = ", ".join(sorted(models))
+            raise ValueError(
+                f"modèle '{model_name}' non supporté pour {exchange_key}/{pair_key}. "
+                f"Modèles autorisés: {allowed_models}"
+            )
+        return model_name
+
     def get_ohlcv(self,
                   exchange,
                   pair,
@@ -279,8 +364,9 @@ class AlgosiaClient:
         ['open_timestamp','open','high','low','close','volume'].
         output: 'pandas' | 'csv' | 'json'.
         dest_path: chemin de sortie si csv/json."""
+        exchange_key, pair_key, _ = self._validate_exchange_pair(exchange, pair)
         rows = self._range_fetch_loop(
-            f"ohlcv/{exchange}/{pair}",
+            f"ohlcv/{exchange_key}/{pair_key}",
             start_ts,
             end_ts,
             max_points,
@@ -308,8 +394,11 @@ class AlgosiaClient:
         ['timestamp','probability'].
         output: 'pandas' | 'csv' | 'json'.
         dest_path: chemin de sortie si csv/json."""
+        exchange_key, pair_key, _ = self._validate_exchange_pair(exchange, pair)
+        model_name_str = str(model_name)
+        self._validate_model(exchange_key, pair_key, model_name_str)
         rows = self._range_fetch_loop(
-            f"predictions/{exchange}/{pair}/{model_name}",
+            f"predictions/{exchange_key}/{pair_key}/{model_name_str}",
             start_ts,
             end_ts,
             max_points,
